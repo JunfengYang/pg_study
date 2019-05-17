@@ -3,6 +3,8 @@
 
 ---
 
+<h1 id="file-code-study">File code study</h1>
+<p>Contents under “storage/file/”.</p>
 <h2 id="relationtable-schema-index-view-...-path-and-name.-commonrelpath.c">Relation(table, schema, index, view …) path and name. common/relpath.c</h2>
 <p>Under the data directory, a relation’s physical storage consists of one or more forks(names for same relation).<br>
 For example a table oid “13059” under database “13213” contains files “13059”(main fork), “13059_fsm”(FSM fork), “13059_vm”(visibility fork). There may also contains a initialization fork.</p>
@@ -352,4 +354,135 @@ Initialization happens after cleanup is complete: we copy each init fork file to
 </ol>
 <h5 id="resetunloggedrelationsint-op-reset-unlogged-relations-from-before-the-last-restart.-the-interface-of-reset.">ResetUnloggedRelations(int op): Reset unlogged relations from before the last restart. The interface of reset.</h5>
 <p>It’ll execute <code>ResetUnloggedRelationsInDbspaceDir</code> for each data directory.</p>
+<h2 id="buffile-storagefilebuffile.c">BufFile: storage/file/buffile.c</h2>
+<p>Management of large buffered files, primarily temporary files.<br>
+BufFile also supports temporary files that exceed the OS file size limit(by opening multiple fd.c temporary files).  This is an essential feature for sorts and hashjoins on large amounts of data.</p>
+<h3 id="structures">Structures</h3>
+<pre class=" language-c"><code class="prism  language-c"><span class="token comment">/*
+ * We break BufFiles into gigabyte-sized segments, regardless of RELSEG_SIZE.
+ * The reason is that we'd like large temporary BufFiles to be spread across
+ * multiple tablespaces when available.
+ */</span>
+<span class="token macro property">#<span class="token directive keyword">define</span> MAX_PHYSICAL_FILESIZE	0x40000000</span>
+<span class="token macro property">#<span class="token directive keyword">define</span> BUFFILE_SEG_SIZE		(MAX_PHYSICAL_FILESIZE / BLCKSZ)</span>
+
+<span class="token comment">/*
+ * This data structure represents a buffered file that consists of one or
+ * more physical files (each accessed through a virtual file descriptor
+ * managed by fd.c).
+ */</span>
+<span class="token keyword">struct</span> BufFile
+<span class="token punctuation">{</span>
+	<span class="token keyword">int</span>			numFiles<span class="token punctuation">;</span>		<span class="token comment">/* number of physical files in set */</span>
+	<span class="token comment">/* all files except the last have length exactly MAX_PHYSICAL_FILESIZE */</span>
+	File	   <span class="token operator">*</span>files<span class="token punctuation">;</span>			<span class="token comment">/* palloc'd array with numFiles entries */</span>
+	off_t	   <span class="token operator">*</span>offsets<span class="token punctuation">;</span>		<span class="token comment">/* palloc'd array with numFiles entries */</span>
+
+	<span class="token comment">/*
+	 * offsets[i] is the current seek position of files[i].  We use this to
+	 * avoid making redundant FileSeek calls.
+	 */</span>
+
+	bool		isTemp<span class="token punctuation">;</span>			<span class="token comment">/* can only add files if this is TRUE */</span>
+	bool		isInterXact<span class="token punctuation">;</span>	<span class="token comment">/* keep open over transactions? */</span>
+	bool		dirty<span class="token punctuation">;</span>			<span class="token comment">/* does buffer need to be written? */</span>
+
+	<span class="token comment">/*
+	 * resowner is the ResourceOwner to use for underlying temp files.  (We
+	 * don't need to remember the memory context we're using explicitly,
+	 * because after creation we only repalloc our arrays larger.)
+	 */</span>
+	ResourceOwner resowner<span class="token punctuation">;</span>
+
+	<span class="token comment">/*
+	 * "current pos" is position of start of buffer within the logical file.
+	 * Position as seen by user of BufFile is (curFile, curOffset + pos).
+	 */</span>
+	<span class="token keyword">int</span>			curFile<span class="token punctuation">;</span>		<span class="token comment">/* file index (0..n) part of current pos */</span>
+	off_t		curOffset<span class="token punctuation">;</span>		<span class="token comment">/* offset part of current pos */</span>
+	<span class="token keyword">int</span>			pos<span class="token punctuation">;</span>			<span class="token comment">/* next read/write position in buffer */</span>
+	<span class="token keyword">int</span>			nbytes<span class="token punctuation">;</span>			<span class="token comment">/* total # of valid bytes in buffer */</span>
+	PGAlignedBlock buffer<span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token comment">// The real position for the whole BufFile is equles: curFile * MAX_PHYSICAL_FILESIZE + curOffset + pos</span>
+</code></pre>
+<h3 id="buffile-intercaces">BufFile intercaces</h3>
+<h4 id="buffile-buffilecreatetempbool-interxact-create-a-buffile-for-a-new-temporary-file">BufFile *BufFileCreateTemp(bool interXact): Create a BufFile for a new temporary file</h4>
+<p>The file may expand to become multiple temporary files if more than MAX_PHYSICAL_FILESIZE bytes are written to it.</p>
+<ol>
+<li>Call VFD’s <code>OpenTemporaryFile(interXact);</code> to open a temporary file, get <code>pfile</code>. If interXact is true, the temp file will not be automatically deleted at end of transaction.</li>
+<li>Call <code>makeBufFile(pfile)</code> to init the BufFule. It’ll <code>palloc</code> the <code>BufFile</code> in current memory context.
+<ul>
+<li><code>BufFile *file = (BufFile *) palloc(sizeof(BufFile));</code></li>
+<li>Set <code>pfile</code>, <code>file-&gt;files[0] = pfile;</code> and init other attributes.</li>
+</ul>
+</li>
+<li>Set <code>file-&gt;isTemp = true;</code> and <code>file-&gt;isInterXact = interXact;</code></li>
+</ol>
+<h4 id="buffileclosebuffile-file-close-a-buffile">BufFileClose(BufFile *file): Close a BufFile</h4>
+<ol>
+<li>Call private routine <code>BufFileFlush(file)</code> tp flush any unwritten data.</li>
+<li>Iterate all temporary files in the BufFule, close one by one.</li>
+<li>pfree the BufFile object.</li>
+</ol>
+<h5 id="buffileflushbuffile-file-flush-any-unwritten-data-like-fflush.">BufFileFlush(BufFile *file): flush any unwritten data like fflush.</h5>
+<p>If the BufFule is dirty. <code>file-&gt;dirty == true</code>, call private routine <code>BufFileDumpBuffer(file)</code>.<br>
+Then if still dirty, return EOF(-1). Else return 0.</p>
+<h5 id="buffiledumpbufferbuffile-file-dump-buffer-contents-starting-at-curoffset.">BufFileDumpBuffer(BufFile *file): Dump buffer contents starting at curOffset.</h5>
+<p>Start from write position <code>wpos = 0</code>, loop the job.<br>
+- Consider add another temp file if <code>file-&gt;curOffset &gt;= MAX_PHYSICAL_FILESIZE &amp;&amp; file-&gt;isTemp</code><br>
+- <code>while (file-&gt;curFile + 1 &gt;= file-&gt;numFiles)</code>, call <code>extendBufFile(file)</code><br>
+- Increase <code>file-&gt;curFile++</code> and set <code>file-&gt;curOffset = 0L;</code><br>
+- Calculate byte to write <code>bytestowrite</code>. If it’s almost end of current temp file, only write <code>MAX_PHYSICAL_FILESIZE - file-&gt;curOffset</code> for current iteration. If not write the whole buffer or the rest of the buffer from last iteration write(which is write to a new extend temp file).<br>
+- Make sure the current temp file’s seek position is equals to <code>file-&gt;curOffset</code>.<br>
+- Write buffer out by calling vfd’s <code>FileWrite</code>.<br>
+- Set current temp file’s seek position by adding wrtite bytes.<br>
+- Move current off set <code>file-&gt;curOffset += bytestowrite;</code> and next write position <code>wpos += bytestowrite;</code><br>
+Reset <code>file-&gt;curOffset</code> to actual offset position since the loop above use it to write into different temp files.<br>
+if <code>file-&gt;curOffset &lt; 0</code> means it shoud pointer to laster file’s offset, so <code>file-&gt;curFile--;</code> and <code>file-&gt;curOffset += MAX_PHYSICAL_FILESIZE;</code>.<br>
+No the buffer is empty.</p>
+<h5 id="extendbuffilebuffile-file-add-another-component-temp-file.">extendBufFile(BufFile *file): Add another component temp file.</h5>
+<ol>
+<li>Call VFD’s <code>OpenTemporaryFile(file-&gt;isInterXact);</code> to open a new temp file.</li>
+<li><code>repalloc</code> the <code>file-&gt;files</code> amd <code>file-&gt;offsets</code> by add one more room.</li>
+<li>Set correspond <code>file-&gt;files[file-&gt;numFiles] = pfile;</code> and <code>file-&gt;offsets[file-&gt;numFiles] = 0L;</code>. Increase <code>file-&gt;numFiles++</code>.</li>
+</ol>
+<h4 id="size_t-buffilereadbuffile-file-void-ptr-size_t-size-like-fread-except-we-assume-1-byte-element-size.">size_t BufFileRead(BufFile *file, void *ptr, size_t size): Like fread() except we assume 1-byte element size.</h4>
+<ol>
+<li>If file is dirty, flush it by <code>BufFileFlush(file)</code></li>
+<li>loop until we read the required <code>size</code>.
+<ul>
+<li>If the fetch start pos larger than total bytes: <code>file-&gt;pos &gt;= file-&gt;nbytes</code>. Set <code>file-&gt;curOffset += file-&gt;pos;</code>, and clear the buffer <code>file-&gt;pos = 0; file-&gt;nbytes = 0;</code>. Call <code>BufFileLoadBuffer(file);</code> to load buffer from <code>file-&gt;curOffset</code> position.</li>
+<li>Calculate current iteration read size <code>nthistime</code> base on current buffer. If required size larger than current unread buffer size, only read current buffer size and set next required size to <code>size -= nthistime;</code>. If required size is less than current unread buffer size, read the size.</li>
+</ul>
+</li>
+<li>return total read size.</li>
+</ol>
+<h5 id="buffileloadbufferbuffile-file-load-some-data-into-buffer-if-possible-starting-from-curoffset.">BufFileLoadBuffer(BufFile *file): Load some data into buffer, if possible, starting from curOffset.</h5>
+<ol>
+<li>If <code>file-&gt;curOffset &gt;= MAX_PHYSICAL_FILESIZE &amp;&amp; file-&gt;curFile + 1 &lt; file-&gt;numFiles</code>, we need increase <code>file-&gt;curFile++;</code> and <code>set file-&gt;curOffset = 0L;</code> means read next temp file.</li>
+<li>Make sure the current temp file’s seek position is equals to <code>file-&gt;curOffset</code>.</li>
+<li>Read next buffer for current temp file. And set <code>file-&gt;nbytes</code> to the read bytes number.</li>
+</ol>
+<h4 id="size_t-buffilewritebuffile-file-void-ptr-size_t-size-like-fwrite-except-we-assume-1-byte-element-size.">size_t BufFileWrite(BufFile *file, void *ptr, size_t size): Like fwrite() except we assume 1-byte element size.</h4>
+<p>Loop until the required write size is &lt; 1.</p>
+<ol>
+<li>if curent buffer position is larger or equal than block size <code>file-&gt;pos &gt;= BLCKSZ</code>. Buffer is full, dump it out by calling <code>BufFileDumpBuffer(file)</code> if it’s dirty.<br>
+Or, it may comes from read operation that fill the buffer full. Increase the current offset <code>file-&gt;curOffset += file-&gt;pos;</code> and set <code>file-&gt;pos = 0; file-&gt;nbytes = 0;</code></li>
+<li>Calculate the max buffer size we can write for current iteration. <code>nthistime = BLCKSZ - file-&gt;pos;</code><br>
+if required write size &gt; <code>nthistime</code>, write current buffer size for current iteration, else write required size.</li>
+<li>Update <code>file-&gt;dirty = true; file-&gt;pos += nthistime; ...</code> reset the required write size for next iteration.<br>
+Return writed size.</li>
+</ol>
+<h4 id="buffileseekbuffile-file-int-fileno-off_t-offset-int-whence-like-fseek">BufFileSeek(BufFile *file, int fileno, off_t offset, int whence): Like fseek()</h4>
+<p>Target position needs two values in order to work when logical filesize exceeds maximum value representable by long.<br>
+Only implement SEEK_SET and SEEK_CUR.<br>
+The main idea is to calculate <code>file-&gt;curFile</code>, <code>file-&gt;curOffset</code>, and <code>file-&gt;pos</code>.<br>
+If seek is to a point within existing buffer; we can just adjust pos-within-buffer, without flushing buffer.<br>
+Otherwise, must reposition buffer, so flush any dirty data. Flush may create new temp file.<br>
+Calculate file number if needed.</p>
+<h4 id="void-buffiletellbuffile-file-int-fileno-off_t-offset-retrieve-current-file-number-and-seek-offset">void BufFileTell(BufFile *file, int *fileno, off_t *offset): Retrieve current file number and seek offset</h4>
+<h4 id="buffileseekblockbuffile-file-long-blknum-block-oriented-seek">BufFileSeekBlock(BufFile *file, long blknum): block-oriented seek</h4>
+<p>Calculate fileno and offset by blknum, call <code>BufFileSeek</code>.</p>
 
